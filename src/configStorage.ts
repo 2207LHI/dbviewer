@@ -6,6 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 const CONNS_KEY = 'dbviewer.connections';
+const QUERY_DRAFTS_KEY = 'dbviewer.queryDrafts';
 const CONFIG_PATH = path.join(os.homedir(), '.dbviewer', 'config.json');
 
 export function loadConfigs(context: vscode.ExtensionContext): ConnectionConfig[] {
@@ -52,5 +53,27 @@ export async function savePwd(context: vscode.ExtensionContext, id: string, pwd:
 export async function deletePwd(context: vscode.ExtensionContext, id: string): Promise<void> {
   try {
     await context.secrets.delete(`dbviewer.pwd.${id}`);
+  } catch {}
+}
+
+export function loadQueryDraft(context: vscode.ExtensionContext, connId: string): string {
+  try {
+    const drafts = context.globalState.get<Record<string, string>>(QUERY_DRAFTS_KEY, {});
+    if (!drafts || typeof drafts !== 'object') {return '';}
+    const value = drafts[connId];
+    return typeof value === 'string' ? value : '';
+  } catch {
+    return '';
+  }
+}
+
+export async function saveQueryDraft(context: vscode.ExtensionContext, connId: string, sql: string): Promise<void> {
+  try {
+    const drafts = context.globalState.get<Record<string, string>>(QUERY_DRAFTS_KEY, {});
+    const nextDrafts = {
+      ...(drafts && typeof drafts === 'object' ? drafts : {}),
+      [connId]: sql,
+    };
+    await context.globalState.update(QUERY_DRAFTS_KEY, nextDrafts);
   } catch {}
 }

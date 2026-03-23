@@ -36,19 +36,57 @@ body {
   padding: 10px 12px;
   border-bottom: 1px solid var(--vscode-panel-border, #444);
 }
-#sql {
-  width: 100%;
-  height: 150px;
-  resize: vertical;
+#sql-wrap {
+  position: relative;
   border: 1px solid var(--vscode-input-border, #666);
   border-radius: 4px;
-  padding: 10px;
   background: var(--vscode-input-background);
-  color: var(--vscode-input-foreground);
+  min-height: 260px;
+}
+#sql {
+  width: 100%;
+  height: 260px;
+  resize: vertical;
+  padding: 10px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--vscode-input-foreground);
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 0.9em;
   line-height: 1.45;
+  position: relative;
+  z-index: 2;
+  overflow: auto;
 }
+#sql:focus {
+  outline: none;
+}
+#sql-highlight {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  margin: 0;
+  padding: 10px;
+  pointer-events: none;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.9em;
+  line-height: 1.45;
+  color: var(--vscode-input-foreground);
+}
+.sql-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); font-weight: 600; }
+.sql-string { color: var(--vscode-terminal-ansiGreen, #ce9178); }
+.sql-number { color: var(--vscode-terminal-ansiCyan, #b5cea8); }
+.sql-comment { color: var(--vscode-descriptionForeground, #6a9955); font-style: italic; }
+.sql-operator { color: var(--vscode-symbolIcon-operatorForeground, #d4d4d4); }
+.sql-ident { color: var(--vscode-symbolIcon-variableForeground, #9cdcfe); }
+.sql-punct { color: var(--vscode-editor-foreground); opacity: 0.8; }
+.sql-space { color: transparent; }
+.sql-eol::before { content: '\A'; white-space: pre; }
 #actions {
   margin-top: 8px;
   display: flex;
@@ -155,9 +193,14 @@ td {
   <div id="db-badge">{{DB}}</div>
 </div>
 <div id="editor">
-  <textarea id="sql">{{DEFAULT_SQL}}</textarea>
+  <div id="sql-wrap">
+    <pre id="sql-highlight"></pre>
+    <textarea id="sql" spellcheck="false">{{DEFAULT_SQL}}</textarea>
+  </div>
   <div id="actions">
     <button onclick="runQuery()">执行 (Ctrl/Cmd+Enter)</button>
+    <button onclick="exportResult()">导出结果 (CSV)</button>
+    <button onclick="exportResult('json')">导出结果 (JSON)</button>
     <span id="hint">仅执行单条 SQL 语句</span>
   </div>
 </div>
@@ -178,9 +221,146 @@ td {
 <script>
 const vscode = acquireVsCodeApi();
 let resultRows = [];
+const sqlEl = document.getElementById('sql');
+const highlightEl = document.getElementById('sql-highlight');
+let saveTimer = null;
+
+const SQL_KEYWORDS = new Set([
+  'SELECT','FROM','WHERE','GROUP','BY','ORDER','LIMIT','OFFSET','INSERT','INTO','VALUES','UPDATE','SET','DELETE',
+  'CREATE','ALTER','DROP','TABLE','DATABASE','INDEX','VIEW','TRIGGER','PROCEDURE','FUNCTION','PRIMARY','KEY',
+  'FOREIGN','REFERENCES','JOIN','LEFT','RIGHT','INNER','OUTER','ON','AS','AND','OR','NOT','NULL','IS','IN',
+  'BETWEEN','LIKE','DISTINCT','HAVING','UNION','ALL','CASE','WHEN','THEN','ELSE','END','SHOW','DESC','EXPLAIN'
+]);
 
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function queueSaveDraft() {
+  if (saveTimer) { clearTimeout(saveTimer); }
+  saveTimer = setTimeout(function() {
+    vscode.postMessage({ command: 'saveDraft', sql: sqlEl.value });
+  }, 250);
+}
+
+function syncHighlightScroll() {
+  highlightEl.scrollTop = sqlEl.scrollTop;
+  highlightEl.scrollLeft = sqlEl.scrollLeft;
+}
+
+function readQuotedToken(input, start, quote) {
+  let idx = start + 1;
+  while (idx < input.length) {
+    const ch = input[idx];
+    if (ch === '\\') {
+      idx += 2;
+      continue;
+    }
+    if (ch === quote) {
+      idx += 1;
+      break;
+    }
+    idx += 1;
+  }
+  return idx;
+}
+
+function renderToken(raw, cls) {
+  if (!raw) { return ''; }
+  let out = '';
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === '\n') {
+      out += '<span class="sql-eol"></span>';
+      continue;
+    }
+    if (ch === ' ') {
+      out += '<span class="sql-space"> </span>';
+      continue;
+    }
+    if (ch === '\t') {
+      out += '<span class="sql-space">\t</span>';
+      continue;
+    }
+    out += '<span class="' + cls + '">' + esc(ch) + '</span>';
+  }
+  return out;
+}
+
+function renderSqlHighlight(sql) {
+  const parts = [];
+  let i = 0;
+
+  while (i < sql.length) {
+    const ch = sql[i];
+
+    if (/\s/.test(ch)) {
+      const start = i;
+      while (i < sql.length && /\s/.test(sql[i])) { i++; }
+      parts.push(renderToken(sql.slice(start, i), 'sql-space'));
+      continue;
+    }
+
+    if (ch === '/' && sql[i + 1] === '*') {
+      const start = i;
+      i += 2;
+      while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) { i++; }
+      if (i < sql.length) { i += 2; }
+      parts.push(renderToken(sql.slice(start, i), 'sql-comment'));
+      continue;
+    }
+
+    if (ch === '-' && sql[i + 1] === '-') {
+      const start = i;
+      i += 2;
+      while (i < sql.length && sql[i] !== '\n') { i++; }
+      parts.push(renderToken(sql.slice(start, i), 'sql-comment'));
+      continue;
+    }
+
+    if (ch === '#') {
+      const start = i;
+      i += 1;
+      while (i < sql.length && sql[i] !== '\n') { i++; }
+      parts.push(renderToken(sql.slice(start, i), 'sql-comment'));
+      continue;
+    }
+
+    if (ch === '\'' || ch === '"' || ch === '`') {
+      const end = readQuotedToken(sql, i, ch);
+      parts.push(renderToken(sql.slice(i, end), 'sql-string'));
+      i = end;
+      continue;
+    }
+
+    if (/\d/.test(ch)) {
+      const start = i;
+      while (i < sql.length && /[\d._]/.test(sql[i])) { i++; }
+      parts.push(renderToken(sql.slice(start, i), 'sql-number'));
+      continue;
+    }
+
+    if (/[A-Za-z_]/.test(ch)) {
+      const start = i;
+      while (i < sql.length && /[A-Za-z0-9_$]/.test(sql[i])) { i++; }
+      const word = sql.slice(start, i);
+      const cls = SQL_KEYWORDS.has(word.toUpperCase()) ? 'sql-keyword' : 'sql-ident';
+      parts.push(renderToken(word, cls));
+      continue;
+    }
+
+    if (/[=<>!+\-*/%|&^~]/.test(ch)) {
+      parts.push(renderToken(ch, 'sql-operator'));
+      i += 1;
+      continue;
+    }
+
+    parts.push(renderToken(ch, 'sql-punct'));
+    i += 1;
+  }
+
+  highlightEl.innerHTML = parts.join('') || '<span class="sql-space"> </span>';
+  syncHighlightScroll();
 }
 
 function setStatus(type, text) {
@@ -190,19 +370,162 @@ function setStatus(type, text) {
 }
 
 function runQuery() {
-  const sql = document.getElementById('sql').value.trim();
+  const sql = sqlEl.value.trim();
   if (!sql) {
     setStatus('error', '请输入 SQL 语句');
     return;
   }
+  vscode.postMessage({ command: 'saveDraft', sql: sqlEl.value });
   setStatus('ok', '执行中...');
   vscode.postMessage({ command: 'execute', sql });
 }
 
+function csvCell(value) {
+  if (value === null || value === undefined) { return ''; }
+  const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  if (/[",\n\r]/.test(text)) {
+    return '"' + text.replace(/"/g, '""') + '"';
+  }
+  return text;
+}
+
+function buildCsv(columns, rows) {
+  const header = columns.map(csvCell).join(',');
+  const lines = rows.map(function(row) {
+    return columns.map(function(col) {
+      return csvCell(row ? row[col] : '');
+    }).join(',');
+  });
+  return '\uFEFF' + [header].concat(lines).join('\n');
+}
+
+function exportResult(format) {
+  const fmt = (format || 'csv').toLowerCase();
+  if (!Array.isArray(resultRows) || resultRows.length === 0) {
+    setStatus('error', '当前没有可导出的查询结果');
+    return;
+  }
+  let content = '';
+  if (fmt === 'json') {
+    content = JSON.stringify(resultRows, null, 2);
+  } else {
+    const table = document.querySelector('#result table');
+    if (!table) {
+      setStatus('error', '当前结果不支持导出');
+      return;
+    }
+
+    const headers = Array.from(table.querySelectorAll('thead th')).map(function(th) {
+      return th.textContent || '';
+    });
+    if (!headers.length) {
+      setStatus('error', '当前结果没有可导出的字段');
+      return;
+    }
+    content = buildCsv(headers, resultRows);
+  }
+
+  vscode.postMessage({
+    command: 'exportResult',
+    format: fmt,
+    content,
+    db: document.getElementById('db-badge').textContent || 'db',
+  });
+}
+
+function toggleLineComments() {
+  const full = sqlEl.value;
+  const selStart = sqlEl.selectionStart;
+  const selEnd = sqlEl.selectionEnd;
+
+  const lineStart = full.lastIndexOf('\n', Math.max(0, selStart - 1)) + 1;
+  let lineEnd = full.indexOf('\n', selEnd);
+  if (lineEnd === -1) { lineEnd = full.length; }
+
+  const block = full.slice(lineStart, lineEnd);
+  const lines = block.split('\n');
+  const hasNonEmpty = lines.some(function(line) { return line.trim().length > 0; });
+  const allCommented = hasNonEmpty && lines.every(function(line) {
+    if (!line.trim()) { return true; }
+    return /^\s*--\s?/.test(line);
+  });
+
+  const nextLines = lines.map(function(line) {
+    if (!line.trim()) { return line; }
+    if (allCommented) {
+      return line.replace(/^(\s*)--\s?/, '$1');
+    }
+    return line.replace(/^(\s*)/, '$1-- ');
+  });
+
+  const nextBlock = nextLines.join('\n');
+  const nextValue = full.slice(0, lineStart) + nextBlock + full.slice(lineEnd);
+  sqlEl.value = nextValue;
+
+  const delta = nextBlock.length - block.length;
+  if (selStart === selEnd) {
+    sqlEl.selectionStart = selStart;
+    sqlEl.selectionEnd = selEnd;
+  } else {
+    sqlEl.selectionStart = lineStart;
+    sqlEl.selectionEnd = selEnd + delta;
+  }
+
+  renderSqlHighlight(sqlEl.value);
+  queueSaveDraft();
+}
+
+function toggleBlockComment() {
+  const full = sqlEl.value;
+  let selStart = sqlEl.selectionStart;
+  let selEnd = sqlEl.selectionEnd;
+
+  if (selStart === selEnd) {
+    const lineStart = full.lastIndexOf('\n', Math.max(0, selStart - 1)) + 1;
+    let lineEnd = full.indexOf('\n', selEnd);
+    if (lineEnd === -1) { lineEnd = full.length; }
+    selStart = lineStart;
+    selEnd = lineEnd;
+  }
+
+  const selected = full.slice(selStart, selEnd);
+  const trimmed = selected.trim();
+  const isWrapped = trimmed.startsWith('/*') && trimmed.endsWith('*/') && trimmed.length >= 4;
+
+  let nextSelected = '';
+  if (isWrapped) {
+    const leftTrimCount = selected.length - selected.trimStart().length;
+    const rightTrimCount = selected.length - selected.trimEnd().length;
+    const coreStart = leftTrimCount + 2;
+    const coreEnd = selected.length - rightTrimCount - 2;
+    nextSelected = selected.slice(0, leftTrimCount) + selected.slice(coreStart, coreEnd) + selected.slice(selected.length - rightTrimCount);
+  } else if (selected.includes('\n')) {
+    nextSelected = '/*\n' + selected + '\n*/';
+  } else {
+    nextSelected = '/* ' + selected + ' */';
+  }
+
+  sqlEl.value = full.slice(0, selStart) + nextSelected + full.slice(selEnd);
+  sqlEl.selectionStart = selStart;
+  sqlEl.selectionEnd = selStart + nextSelected.length;
+
+  renderSqlHighlight(sqlEl.value);
+  queueSaveDraft();
+}
+
 window.addEventListener('message', function(e) {
   const msg = e.data;
+  if (msg.type === 'init') {
+    sqlEl.value = String(msg.sql || '');
+    renderSqlHighlight(sqlEl.value);
+    return;
+  }
   if (msg.type === 'error') {
     setStatus('error', msg.message || '执行失败');
+    return;
+  }
+  if (msg.type === 'exported') {
+    setStatus('ok', msg.message || '导出成功');
     return;
   }
   if (msg.type !== 'result') { return; }
@@ -318,9 +641,28 @@ function jsonHL(val, depth) {
 }
 
 document.addEventListener('keydown', function(ev) {
+  if ((ev.key === 'A' || ev.key === 'a') && ev.shiftKey && ev.altKey) {
+    ev.preventDefault();
+    toggleBlockComment();
+    return;
+  }
+  if (ev.key === '/' && (ev.metaKey || ev.ctrlKey)) {
+    ev.preventDefault();
+    toggleLineComments();
+    return;
+  }
   if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) runQuery();
   if (ev.key === 'Escape') closeModal();
 });
+
+sqlEl.addEventListener('input', function() {
+  renderSqlHighlight(sqlEl.value);
+  queueSaveDraft();
+});
+sqlEl.addEventListener('scroll', syncHighlightScroll);
+
+renderSqlHighlight(sqlEl.value);
+vscode.postMessage({ command: 'ready' });
 </script>
 </body>
 </html>

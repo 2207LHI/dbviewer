@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import * as mysql from 'mysql2/promise';
+import { loadQueryDraft, saveQueryDraft } from './configStorage';
 
 export class TableViewPanel {
   static show(extensionPath: string, conn: mysql.Connection, dbName: string, tableName: string) {
@@ -70,7 +71,7 @@ export class TableViewPanel {
 }
 
 export class SqlQueryPanel {
-  static show(extensionPath: string, conn: mysql.Connection, connId: string, dbName: string, tableName?: string) {
+  static show(context: vscode.ExtensionContext, extensionPath: string, conn: mysql.Connection, connId: string, dbName: string, tableName?: string) {
     const title = tableName ? `查询 ${dbName}.${tableName}` : `查询 ${dbName}`;
     const panel = vscode.window.createWebviewPanel(
       'dbviewerQuery',
@@ -84,15 +85,67 @@ export class SqlQueryPanel {
     const defaultSql = tableName
       ? `SELECT * FROM \`${dbName}\`.\`${tableName}\` LIMIT 100;`
       : `SHOW TABLES;`;
+    const escapedDefaultSql = defaultSql
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
 
     html = html.replace(/\{\{TITLE\}\}/g, title)
                .replace(/\{\{DB\}\}/g, dbName)
                .replace(/\{\{TBL\}\}/g, tableName || '')
                .replace(/\{\{CONNID\}\}/g, connId)
-               .replace(/\{\{DEFAULT_SQL\}\}/g, defaultSql);
+               .replace(/\{\{DEFAULT_SQL\}\}/g, escapedDefaultSql);
     panel.webview.html = html;
     // 处理来自页面的执行请求
     panel.webview.onDidReceiveMessage(async (msg) => {
+      if (!msg || typeof msg !== 'object') { return; }
+
+      if (msg.command === 'ready') {
+        const savedSql = loadQueryDraft(context, connId);
+        panel.webview.postMessage({
+          type: 'init',
+          sql: savedSql || defaultSql,
+        });
+        return;
+      }
+
+      if (msg.command === 'saveDraft') {
+        await saveQueryDraft(context, connId, String(msg.sql ?? ''));
+        return;
+      }
+
+      if (msg.command === 'exportResult') {
+        try {
+          const format = String(msg.format || 'csv').toLowerCase();
+          const ext = format === 'json' ? 'json' : 'csv';
+          const dbLabel = String(msg.db || dbName || 'db').replace(/[^\w.-]+/g, '_');
+          const timestamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+          const defaultName = `query-${dbLabel}-${timestamp}.${ext}`;
+          const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+          const defaultUri = wsFolder ? vscode.Uri.joinPath(wsFolder, defaultName) : undefined;
+
+          const uri = await vscode.window.showSaveDialog({
+            saveLabel: '导出查询结果',
+            filters: format === 'json'
+              ? { 'JSON 文件': ['json'] }
+              : { 'CSV 文件': ['csv'] },
+            defaultUri,
+          });
+          if (!uri) {
+            panel.webview.postMessage({ type: 'error', message: '已取消导出' });
+            return;
+          }
+
+          const content = String(msg.content || '');
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+          panel.webview.postMessage({ type: 'exported', message: `导出成功：${uri.fsPath}` });
+          return;
+        } catch (err) {
+          panel.webview.postMessage({ type: 'error', message: typeof err === 'object' && err && 'message' in err ? (err as any).message : String(err) });
+          return;
+        }
+      }
+
       if (!msg || msg.command !== 'execute') { return; }
       const sql = String(msg.sql || '').trim();
       if (!sql) {

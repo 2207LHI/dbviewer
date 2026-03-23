@@ -56,8 +56,8 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
             const conn = this.dbManager.getConnection(cfg.id);
             if (conn) { this.connections.set(cfg.id, conn); }
         }
-        // 仅刷新该连接节点，避免影响其它连接的 UI 状态
-        this.refreshConnectionNode(cfg.id);
+        // 连接状态变化后做全量刷新，确保节点展开/子节点加载与最新连接状态一致
+        this.refresh();
     }
 
     private sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -120,7 +120,7 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
                 this.connToSshKey.delete(id);
             }
             // 仅刷新该连接节点，避免影响其它连接的 UI 状态
-            this.refreshConnectionNode(id);
+            this.refresh();
         } catch (err) {
             outputChannel?.appendLine(`[ERROR] disconnect failed for ${id}: ${(err as Error).message}`);
             throw err;
@@ -128,8 +128,8 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
     }
 
 
-    markFailed(id: string) { this.failedConnections.add(id); this.refreshConnectionNode(id); }
-    clearFailed(id: string) { if (this.failedConnections.has(id)) { this.failedConnections.delete(id); this.refreshConnectionNode(id); } }
+    markFailed(id: string) { this.failedConnections.add(id); this.refresh(); }
+    clearFailed(id: string) { if (this.failedConnections.has(id)) { this.failedConnections.delete(id); this.refresh(); } }
     isFailed(id: string) { return this.failedConnections.has(id); }
 
     async disconnectAll(): Promise<void> {
@@ -189,7 +189,7 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
                 const conn = this.connections.get(element.node.connId);
                 if (!conn) { return []; }
                 try {
-                    const [rows] = await conn.execute<mysql.RowDataPacket[]>('SHOW DATABASES');
+                    const [rows] = await conn.query<mysql.RowDataPacket[]>('SHOW DATABASES');
                     if (!Array.isArray(rows)) {
                         try { outputChannel?.appendLine(`[WARN] SHOW DATABASES returned non-array for connId=${element.node.connId}: ${JSON.stringify(rows).slice(0,200)}`); } catch {}
                         return [];
@@ -214,7 +214,7 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
                 if (!conn) { return []; }
                 const dbName = element.node.label;
                 try {
-                    const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+                    const [rows] = await conn.query<mysql.RowDataPacket[]>(
                         `SHOW TABLES FROM \`${dbName}\``
                     );
                     if (!Array.isArray(rows)) {
@@ -222,11 +222,24 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
                         return [];
                     }
                     try { outputChannel?.appendLine(`[DBG] SHOW TABLES returned ${rows.length} rows for ${dbName} on connId=${element.node.connId}`); } catch {}
-                    const key = `Tables_in_${dbName}`;
+                    const readTableName = (row: mysql.RowDataPacket): string => {
+                        const directKey = `Tables_in_${dbName}`;
+                        const anyRow = row as Record<string, unknown>;
+                        if (typeof anyRow[directKey] === 'string') {
+                            return anyRow[directKey] as string;
+                        }
+                        const autoKey = Object.keys(anyRow).find(k => k.toLowerCase().startsWith('tables_in_'));
+                        if (autoKey && typeof anyRow[autoKey] === 'string') {
+                            return anyRow[autoKey] as string;
+                        }
+                        const first = Object.values(anyRow)[0];
+                        return typeof first === 'string' ? first : String(first ?? '');
+                    };
                     return rows.map(row => {
+                        const tableLabel = readTableName(row);
                         const item = new DatabaseTreeItem(
-                            { type: 'table', label: row[key] as string, connId: element.node.connId, database: dbName },
-                            row[key] as string,
+                            { type: 'table', label: tableLabel, connId: element.node.connId, database: dbName },
+                            tableLabel,
                             vscode.TreeItemCollapsibleState.None
                         );
                         item.command = {
@@ -323,11 +336,11 @@ export function activate(context: vscode.ExtensionContext) {
 			return;
 		}
 		if (item.node.type === 'database') {
-			SqlQueryPanel.show(context.extensionPath, conn, item.node.connId, item.node.label);
+            SqlQueryPanel.show(context, context.extensionPath, conn, item.node.connId, item.node.label);
 			return;
 		}
 		if (item.node.type === 'table' && item.node.database) {
-			SqlQueryPanel.show(context.extensionPath, conn, item.node.connId, item.node.database, item.node.label);
+            SqlQueryPanel.show(context, context.extensionPath, conn, item.node.connId, item.node.database, item.node.label);
 		}
 	});
 
