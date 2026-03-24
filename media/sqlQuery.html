@@ -50,6 +50,29 @@ body {
   height: 100%;
   border-radius: 4px;
 }
+#editor-menu {
+  position: fixed;
+  z-index: 2000;
+  display: none;
+  min-width: 130px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, #555));
+  border-radius: 4px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
+  padding: 4px;
+}
+#editor-menu button {
+  width: 100%;
+  border: none;
+  text-align: left;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  padding: 5px 8px;
+}
+#editor-menu button:hover {
+  background: var(--vscode-list-hoverBackground, var(--vscode-toolbar-hoverBackground));
+}
 #sql-fallback {
   display: none;
   width: 100%;
@@ -194,12 +217,20 @@ td {
   </div>
 </div>
 
+<div id="editor-menu">
+  <button type="button" data-action="cut">剪切</button>
+  <button type="button" data-action="copy">复制</button>
+  <button type="button" data-action="paste">粘贴</button>
+  <button type="button" data-action="selectAll">全选</button>
+</div>
+
 <script src="{{MONACO_LOADER_URI}}"></script>
 <script>
 const vscode = acquireVsCodeApi();
 let resultRows = [];
 const editorEl = document.getElementById('sql-editor');
 const fallbackEl = document.getElementById('sql-fallback');
+const editorMenuEl = document.getElementById('editor-menu');
 let saveTimer = null;
 let monacoEditor = null;
 let monacoRef = null;
@@ -208,6 +239,7 @@ const pendingSchema = new Map();
 const schemaReqTimeoutMs = 6000;
 let validateTimer = null;
 const markerOwner = 'dbviewer-sql';
+let menuVisible = false;
 
 const SQL_KEYWORDS = [
   'SELECT','FROM','WHERE','GROUP','BY','ORDER','LIMIT','OFFSET','INSERT','INTO','VALUES','UPDATE','SET','DELETE',
@@ -261,6 +293,80 @@ function queueSaveDraft() {
   saveTimer = setTimeout(function() {
     vscode.postMessage({ command: 'saveDraft', sql: getEditorValue() });
   }, 250);
+}
+
+function showEditorMenu(x, y) {
+  if (!editorMenuEl || !monacoEditor || !monacoEditor.hasTextFocus()) { return; }
+  editorMenuEl.style.left = x + 'px';
+  editorMenuEl.style.top = y + 'px';
+  editorMenuEl.style.display = 'block';
+  menuVisible = true;
+}
+
+function hideEditorMenu() {
+  if (!editorMenuEl) { return; }
+  editorMenuEl.style.display = 'none';
+  menuVisible = false;
+}
+
+function getMonacoSelectionText() {
+  if (!monacoEditor) { return ''; }
+  const model = monacoEditor.getModel();
+  const selection = monacoEditor.getSelection();
+  if (!model || !selection || selection.isEmpty()) { return ''; }
+  return model.getValueInRange(selection);
+}
+
+function replaceMonacoSelection(text) {
+  if (!monacoEditor) { return; }
+  const selection = monacoEditor.getSelection();
+  if (!selection) { return; }
+  monacoEditor.executeEdits('clipboard', [{ range: selection, text, forceMoveMarkers: true }]);
+}
+
+async function copyFromEditor() {
+  if (!monacoEditor) {
+    return;
+  }
+  const selected = getMonacoSelectionText();
+  if (!selected) { return; }
+  await navigator.clipboard.writeText(selected);
+}
+
+async function cutFromEditor() {
+  if (!monacoEditor) { return; }
+  const selected = getMonacoSelectionText();
+  if (!selected) { return; }
+  await navigator.clipboard.writeText(selected);
+  replaceMonacoSelection('');
+}
+
+async function pasteToEditor() {
+  if (!monacoEditor) { return; }
+  const text = await navigator.clipboard.readText();
+  if (typeof text !== 'string') { return; }
+  replaceMonacoSelection(text);
+}
+
+function selectAllInEditor() {
+  if (!monacoEditor || !monacoRef) { return; }
+  monacoEditor.trigger('dbviewer', 'editor.action.selectAll', null);
+}
+
+async function handleClipboardAction(action) {
+  try {
+    if (action === 'copy') {
+      await copyFromEditor();
+    } else if (action === 'cut') {
+      await cutFromEditor();
+    } else if (action === 'paste') {
+      await pasteToEditor();
+    } else if (action === 'selectAll') {
+      selectAllInEditor();
+    }
+  } catch (err) {
+    setStatus('error', '剪贴板操作失败，请检查系统剪贴板权限');
+  }
 }
 
 function requestSchema(force) {
@@ -892,7 +998,30 @@ function jsonHL(val, depth) {
 }
 
 document.addEventListener('keydown', function(ev) {
+  if (monacoEditor && monacoEditor.hasTextFocus() && (ev.metaKey || ev.ctrlKey)) {
+    const key = String(ev.key || '').toLowerCase();
+    if (key === 'c' || key === 'x' || key === 'v' || key === 'a') {
+      ev.preventDefault();
+      if (key === 'c') { handleClipboardAction('copy'); }
+      if (key === 'x') { handleClipboardAction('cut'); }
+      if (key === 'v') { handleClipboardAction('paste'); }
+      if (key === 'a') { handleClipboardAction('selectAll'); }
+      return;
+    }
+  }
   if (ev.key === 'Escape') closeModal();
+});
+
+document.addEventListener('click', function(ev) {
+  if (!menuVisible) { return; }
+  const target = ev.target;
+  if (target instanceof HTMLElement && editorMenuEl.contains(target)) {
+    const action = target.dataset.action;
+    if (action) {
+      handleClipboardAction(action);
+    }
+  }
+  hideEditorMenu();
 });
 
 function setupMonaco() {
@@ -918,6 +1047,7 @@ function setupMonaco() {
       value: fallbackEl.value || '',
       language: 'sql',
       automaticLayout: true,
+      contextmenu: false,
       minimap: { enabled: false },
       fontSize: 13,
       lineNumbers: 'on',
@@ -938,6 +1068,16 @@ function setupMonaco() {
       scheduleValidation();
     });
     monacoEditor.addCommand(monacoRef.KeyMod.CtrlCmd | monacoRef.KeyCode.Enter, runQuery);
+    editorEl.addEventListener('contextmenu', function(ev) {
+      ev.preventDefault();
+      monacoEditor.focus();
+      showEditorMenu(ev.clientX, ev.clientY);
+    });
+
+    editorEl.addEventListener('mousedown', function() {
+      if (menuVisible) { hideEditorMenu(); }
+    });
+
     scheduleValidation();
     requestSchema(true).catch(function() {});
   }, function() {
