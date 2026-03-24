@@ -77,10 +77,23 @@ export class SqlQueryPanel {
       'dbviewerQuery',
       title,
       vscode.ViewColumn.One,
-      { enableScripts: true, retainContextWhenHidden: true }
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [
+          vscode.Uri.file(path.join(extensionPath, 'media')),
+          vscode.Uri.file(path.join(extensionPath, 'node_modules', 'monaco-editor', 'min')),
+        ],
+      }
     );
     const htmlPath = path.join(extensionPath, 'media', 'sqlQuery.html');
     let html = fs.readFileSync(htmlPath, 'utf8');
+    const monacoBaseUri = panel.webview
+      .asWebviewUri(vscode.Uri.file(path.join(extensionPath, 'node_modules', 'monaco-editor', 'min', 'vs')))
+      .toString();
+    const monacoLoaderUri = panel.webview
+      .asWebviewUri(vscode.Uri.file(path.join(extensionPath, 'node_modules', 'monaco-editor', 'min', 'vs', 'loader.js')))
+      .toString();
     // 根据是否传入 tableName 生成合理的默认 SQL
     const defaultSql = tableName
       ? `SELECT * FROM \`${dbName}\`.\`${tableName}\` LIMIT 100;`
@@ -94,11 +107,91 @@ export class SqlQueryPanel {
                .replace(/\{\{DB\}\}/g, dbName)
                .replace(/\{\{TBL\}\}/g, tableName || '')
                .replace(/\{\{CONNID\}\}/g, connId)
-               .replace(/\{\{DEFAULT_SQL\}\}/g, escapedDefaultSql);
+               .replace(/\{\{DEFAULT_SQL\}\}/g, escapedDefaultSql)
+               .replace(/\{\{MONACO_BASE_URI\}\}/g, monacoBaseUri)
+               .replace(/\{\{MONACO_LOADER_URI\}\}/g, monacoLoaderUri);
     panel.webview.html = html;
+
+    let schemaCache: { expiresAt: number; data: any } | undefined;
+    const loadSchema = async (force = false) => {
+      const now = Date.now();
+      if (!force && schemaCache && schemaCache.expiresAt > now) {
+        return schemaCache.data;
+      }
+
+      const [tableRows] = await conn.query<any[]>(
+        `SELECT TABLE_NAME, TABLE_TYPE
+         FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = ?
+         ORDER BY TABLE_NAME`,
+        [dbName]
+      );
+
+      const [columnRows] = await conn.query<any[]>(
+        `SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, COLUMN_KEY, IS_NULLABLE, COLUMN_COMMENT
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ?
+         ORDER BY TABLE_NAME, ORDINAL_POSITION`,
+        [dbName]
+      );
+
+      const columnsByTable = new Map<string, any[]>();
+      for (const row of Array.isArray(columnRows) ? columnRows : []) {
+        const table = String(row.TABLE_NAME || '');
+        if (!columnsByTable.has(table)) {
+          columnsByTable.set(table, []);
+        }
+        columnsByTable.get(table)!.push({
+          name: String(row.COLUMN_NAME || ''),
+          dataType: String(row.DATA_TYPE || ''),
+          columnType: String(row.COLUMN_TYPE || ''),
+          key: String(row.COLUMN_KEY || ''),
+          nullable: String(row.IS_NULLABLE || ''),
+          comment: String(row.COLUMN_COMMENT || ''),
+        });
+      }
+
+      const tables = (Array.isArray(tableRows) ? tableRows : []).map((row) => {
+        const name = String(row.TABLE_NAME || '');
+        return {
+          name,
+          type: String(row.TABLE_TYPE || 'BASE TABLE'),
+          columns: columnsByTable.get(name) || [],
+        };
+      });
+
+      const data = {
+        dbName,
+        fetchedAt: new Date().toISOString(),
+        tables,
+      };
+
+      schemaCache = { expiresAt: now + 60_000, data };
+      return data;
+    };
+
     // 处理来自页面的执行请求
     panel.webview.onDidReceiveMessage(async (msg) => {
       if (!msg || typeof msg !== 'object') { return; }
+
+      if (msg.command === 'getIntellisenseSchema') {
+        const requestId = String(msg.requestId || '');
+        try {
+          const schema = await loadSchema(Boolean(msg.force));
+          panel.webview.postMessage({
+            type: 'intellisenseSchema',
+            requestId,
+            schema,
+          });
+        } catch (err) {
+          panel.webview.postMessage({
+            type: 'intellisenseSchema',
+            requestId,
+            error: typeof err === 'object' && err && 'message' in err ? (err as any).message : String(err),
+          });
+        }
+        return;
+      }
 
       if (msg.command === 'ready') {
         const savedSql = loadQueryDraft(context, connId);

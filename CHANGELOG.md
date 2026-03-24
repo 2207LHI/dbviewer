@@ -8,6 +8,15 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - 初始开发与修复（见下面版本历史）
 
+## [0.0.5] - 2026-03-24
+
+- SQL 查询编辑器升级为 Monaco：支持更完善的编辑体验、建议面板和悬浮信息展示。
+- SQL 智能提示增强：支持 SQL 关键字、模板片段、表名、列名、`alias.column` 场景补全。
+- 查询上下文补全增强：在 `FROM/JOIN/INTO/UPDATE` 后优先建议表名，在 `SELECT/WHERE/ON/HAVING/SET/GROUP BY/ORDER BY` 等语境优先列名。
+- 新增轻量语法诊断：执行前检查引号未闭合、括号不匹配及多语句提醒，并在编辑器内显示标记。
+- 查询编辑框主题适配优化：颜色与建议框风格对齐 VS Code 当前主题。
+- 查询页新增 schema 元数据接口与缓存机制（60 秒）以提升补全响应性能。
+
 ## [0.0.4] - 2026-03-24
 
 - SQL 查询面板增强：支持 SQL 关键字高亮、注释高亮（`--`、`#`、`/* ... */`），并将默认输入区高度提升到 260px。

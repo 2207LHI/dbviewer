@@ -37,56 +37,32 @@ body {
   border-bottom: 1px solid var(--vscode-panel-border, #444);
 }
 #sql-wrap {
-  position: relative;
-  border: 1px solid var(--vscode-input-border, #666);
+  border: 1px solid var(--vscode-editorWidget-border, var(--vscode-input-border, #666));
   border-radius: 4px;
-  background: var(--vscode-input-background);
-  min-height: 260px;
+  background: var(--vscode-editor-background);
+  height: 280px;
 }
-#sql {
+#sql-wrap:focus-within {
+  border-color: var(--vscode-focusBorder, var(--vscode-editorWidget-border, #666));
+}
+#sql-editor {
   width: 100%;
-  height: 260px;
-  resize: vertical;
-  padding: 10px;
-  border: none;
+  height: 100%;
   border-radius: 4px;
-  background: transparent;
-  color: transparent;
-  caret-color: var(--vscode-input-foreground);
-  font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 0.9em;
-  line-height: 1.45;
-  position: relative;
-  z-index: 2;
-  overflow: auto;
 }
-#sql:focus {
+#sql-fallback {
+  display: none;
+  width: 100%;
+  height: 100%;
+  border: none;
   outline: none;
-}
-#sql-highlight {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  margin: 0;
   padding: 10px;
-  pointer-events: none;
-  overflow: hidden;
-  white-space: pre-wrap;
-  word-break: break-word;
+  background: transparent;
+  color: var(--vscode-input-foreground);
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 0.9em;
   line-height: 1.45;
-  color: var(--vscode-input-foreground);
 }
-.sql-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); font-weight: 600; }
-.sql-string { color: var(--vscode-terminal-ansiGreen, #ce9178); }
-.sql-number { color: var(--vscode-terminal-ansiCyan, #b5cea8); }
-.sql-comment { color: var(--vscode-descriptionForeground, #6a9955); font-style: italic; }
-.sql-operator { color: var(--vscode-symbolIcon-operatorForeground, #d4d4d4); }
-.sql-ident { color: var(--vscode-symbolIcon-variableForeground, #9cdcfe); }
-.sql-punct { color: var(--vscode-editor-foreground); opacity: 0.8; }
-.sql-space { color: transparent; }
-.sql-eol::before { content: '\A'; white-space: pre; }
 #actions {
   margin-top: 8px;
   display: flex;
@@ -194,8 +170,8 @@ td {
 </div>
 <div id="editor">
   <div id="sql-wrap">
-    <pre id="sql-highlight"></pre>
-    <textarea id="sql" spellcheck="false">{{DEFAULT_SQL}}</textarea>
+    <div id="sql-editor"></div>
+    <textarea id="sql-fallback" spellcheck="false">{{DEFAULT_SQL}}</textarea>
   </div>
   <div id="actions">
     <button onclick="runQuery()">执行 (Ctrl/Cmd+Enter)</button>
@@ -218,19 +194,63 @@ td {
   </div>
 </div>
 
+<script src="{{MONACO_LOADER_URI}}"></script>
 <script>
 const vscode = acquireVsCodeApi();
 let resultRows = [];
-const sqlEl = document.getElementById('sql');
-const highlightEl = document.getElementById('sql-highlight');
+const editorEl = document.getElementById('sql-editor');
+const fallbackEl = document.getElementById('sql-fallback');
 let saveTimer = null;
+let monacoEditor = null;
+let monacoRef = null;
+let schemaCache = null;
+const pendingSchema = new Map();
+const schemaReqTimeoutMs = 6000;
+let validateTimer = null;
+const markerOwner = 'dbviewer-sql';
 
-const SQL_KEYWORDS = new Set([
+const SQL_KEYWORDS = [
   'SELECT','FROM','WHERE','GROUP','BY','ORDER','LIMIT','OFFSET','INSERT','INTO','VALUES','UPDATE','SET','DELETE',
   'CREATE','ALTER','DROP','TABLE','DATABASE','INDEX','VIEW','TRIGGER','PROCEDURE','FUNCTION','PRIMARY','KEY',
   'FOREIGN','REFERENCES','JOIN','LEFT','RIGHT','INNER','OUTER','ON','AS','AND','OR','NOT','NULL','IS','IN',
-  'BETWEEN','LIKE','DISTINCT','HAVING','UNION','ALL','CASE','WHEN','THEN','ELSE','END','SHOW','DESC','EXPLAIN'
-]);
+  'BETWEEN','LIKE','DISTINCT','HAVING','UNION','ALL','CASE','WHEN','THEN','ELSE','END','SHOW','DESC','EXPLAIN',
+  'EXISTS','COUNT','SUM','AVG','MIN','MAX','HAVING','USE'
+];
+
+const SQL_SNIPPETS = [
+  {
+    label: 'SELECT template',
+    insertText: 'SELECT ${1:*}\nFROM ${2:table_name}\nWHERE ${3:condition};',
+    detail: '查询模板'
+  },
+  {
+    label: 'INSERT template',
+    insertText: 'INSERT INTO ${1:table_name} (${2:col1, col2})\nVALUES (${3:val1, val2});',
+    detail: '插入模板'
+  },
+  {
+    label: 'UPDATE template',
+    insertText: 'UPDATE ${1:table_name}\nSET ${2:col} = ${3:value}\nWHERE ${4:condition};',
+    detail: '更新模板'
+  }
+];
+
+function normalizeIdentifier(raw) {
+  return String(raw || '').replace(/[`"']/g, '').split('.').pop() || '';
+}
+
+function getEditorValue() {
+  return monacoEditor ? monacoEditor.getValue() : fallbackEl.value;
+}
+
+function setEditorValue(v) {
+  const val = String(v || '');
+  if (monacoEditor) {
+    monacoEditor.setValue(val);
+    return;
+  }
+  fallbackEl.value = val;
+}
 
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -239,128 +259,410 @@ function esc(s) {
 function queueSaveDraft() {
   if (saveTimer) { clearTimeout(saveTimer); }
   saveTimer = setTimeout(function() {
-    vscode.postMessage({ command: 'saveDraft', sql: sqlEl.value });
+    vscode.postMessage({ command: 'saveDraft', sql: getEditorValue() });
   }, 250);
 }
 
-function syncHighlightScroll() {
-  highlightEl.scrollTop = sqlEl.scrollTop;
-  highlightEl.scrollLeft = sqlEl.scrollLeft;
+function requestSchema(force) {
+  return new Promise(function(resolve) {
+    const requestId = 'schema-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const timer = setTimeout(function() {
+      if (pendingSchema.has(requestId)) {
+        pendingSchema.delete(requestId);
+        resolve(null);
+      }
+    }, schemaReqTimeoutMs);
+    pendingSchema.set(requestId, { resolve, timer });
+    vscode.postMessage({ command: 'getIntellisenseSchema', requestId, force: !!force });
+  });
 }
 
-function readQuotedToken(input, start, quote) {
-  let idx = start + 1;
-  while (idx < input.length) {
-    const ch = input[idx];
-    if (ch === '\\') {
-      idx += 2;
-      continue;
+function parseAliasMap(sqlText) {
+  const aliasMap = new Map();
+  const pattern = /\b(?:from|join)\s+([`"\w.]+)(?:\s+(?:as\s+)?)?([`"\w]+)?/ig;
+  let match;
+  while ((match = pattern.exec(sqlText))) {
+    const table = normalizeIdentifier(match[1]);
+    const alias = normalizeIdentifier(match[2] || '');
+    if (table) {
+      aliasMap.set(table.toLowerCase(), table);
+      if (alias && alias.toLowerCase() !== table.toLowerCase()) {
+        aliasMap.set(alias.toLowerCase(), table);
+      }
     }
-    if (ch === quote) {
-      idx += 1;
-      break;
-    }
-    idx += 1;
   }
-  return idx;
+  return aliasMap;
 }
 
-function renderToken(raw, cls) {
-  if (!raw) { return ''; }
-  let out = '';
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i];
-    if (ch === '\n') {
-      out += '<span class="sql-eol"></span>';
-      continue;
+function findTableInSchema(schema, tableOrAlias, aliasMap) {
+  if (!schema || !Array.isArray(schema.tables)) { return null; }
+  const normalized = normalizeIdentifier(tableOrAlias).toLowerCase();
+  const actual = normalizeIdentifier(aliasMap.get(normalized) || tableOrAlias).toLowerCase();
+  return schema.tables.find(function(t) {
+    return normalizeIdentifier(t.name).toLowerCase() === actual;
+  }) || null;
+}
+
+function getCompletionContext(prefixText) {
+  const tail = prefixText.slice(-300);
+  const needsTable = /(?:from|join|into|update|table)\s+[`"\w.]*$/i.test(prefixText);
+  const dotMatch = /([`"\w]+)\.([`"\w]*)$/i.exec(prefixText);
+  const prefersColumn = /(?:select|where|on|having|set|group\s+by|order\s+by)\s+[`"\w.,\s]*$/i.test(tail);
+  return { needsTable, dotMatch, prefersColumn };
+}
+
+async function ensureSchema() {
+  if (schemaCache && schemaCache.tables) { return schemaCache; }
+  schemaCache = await requestSchema(false);
+  return schemaCache;
+}
+
+function registerIntellisense(monaco) {
+  monaco.languages.registerCompletionItemProvider('sql', {
+    triggerCharacters: ['.', ' ', '`'],
+    provideCompletionItems: async function(model, position) {
+      const word = model.getWordUntilPosition(position);
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: word.startColumn,
+        endColumn: word.endColumn,
+      };
+      const prefixText = model.getValueInRange({
+        startLineNumber: 1,
+        startColumn: 1,
+        endLineNumber: position.lineNumber,
+        endColumn: position.column,
+      });
+
+      const schema = await ensureSchema();
+      const aliasMap = parseAliasMap(model.getValue());
+      const context = getCompletionContext(prefixText);
+      const suggestions = [];
+
+      for (const keyword of SQL_KEYWORDS) {
+        suggestions.push({
+          label: keyword,
+          kind: monaco.languages.CompletionItemKind.Keyword,
+          insertText: keyword,
+          sortText: '3_' + keyword,
+          range,
+        });
+      }
+
+      for (const snippet of SQL_SNIPPETS) {
+        suggestions.push({
+          label: snippet.label,
+          kind: monaco.languages.CompletionItemKind.Snippet,
+          insertText: snippet.insertText,
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: snippet.detail,
+          sortText: '4_' + snippet.label,
+          range,
+        });
+      }
+
+      if (schema && Array.isArray(schema.tables)) {
+        if (context.dotMatch) {
+          const tableOrAlias = normalizeIdentifier(context.dotMatch[1]);
+          const table = findTableInSchema(schema, tableOrAlias, aliasMap);
+          if (table && Array.isArray(table.columns)) {
+            for (const col of table.columns) {
+              suggestions.push({
+                label: col.name,
+                kind: monaco.languages.CompletionItemKind.Field,
+                insertText: col.name,
+                detail: col.columnType || col.dataType || 'column',
+                documentation: col.comment || '',
+                sortText: '0_' + col.name,
+                range,
+              });
+            }
+          }
+        } else if (context.needsTable) {
+          for (const t of schema.tables) {
+            suggestions.push({
+              label: t.name,
+              kind: monaco.languages.CompletionItemKind.Class,
+              insertText: t.name,
+              detail: t.type || 'TABLE',
+              sortText: '0_' + t.name,
+              range,
+            });
+          }
+        } else {
+          if (context.prefersColumn) {
+            const added = new Set();
+            for (const mappedTableName of aliasMap.values()) {
+              const table = findTableInSchema(schema, mappedTableName, new Map());
+              if (!table || !Array.isArray(table.columns)) { continue; }
+              for (const col of table.columns) {
+                const key = (table.name + '.' + col.name).toLowerCase();
+                if (added.has(key)) { continue; }
+                added.add(key);
+                suggestions.push({
+                  label: col.name,
+                  kind: monaco.languages.CompletionItemKind.Field,
+                  insertText: col.name,
+                  detail: table.name + ' · ' + (col.columnType || col.dataType || 'column'),
+                  documentation: col.comment || '',
+                  sortText: '0_' + col.name,
+                  range,
+                });
+              }
+            }
+          }
+
+          for (const t of schema.tables) {
+            suggestions.push({
+              label: t.name,
+              kind: monaco.languages.CompletionItemKind.Class,
+              insertText: t.name,
+              detail: t.type || 'TABLE',
+              sortText: context.prefersColumn ? '2_' + t.name : '1_' + t.name,
+              range,
+            });
+            for (const col of (t.columns || [])) {
+              suggestions.push({
+                label: col.name,
+                kind: monaco.languages.CompletionItemKind.Field,
+                insertText: col.name,
+                detail: t.name + ' · ' + (col.columnType || col.dataType || 'column'),
+                documentation: col.comment || '',
+                sortText: context.prefersColumn ? '1_' + col.name : '0_' + col.name,
+                range,
+              });
+            }
+          }
+        }
+      }
+
+      return { suggestions };
     }
-    if (ch === ' ') {
-      out += '<span class="sql-space"> </span>';
-      continue;
+  });
+
+  monaco.languages.registerHoverProvider('sql', {
+    provideHover: async function(model, position) {
+      const wordInfo = model.getWordAtPosition(position);
+      if (!wordInfo || !wordInfo.word) { return null; }
+      const schema = await ensureSchema();
+      const target = normalizeIdentifier(wordInfo.word).toLowerCase();
+      if (!schema || !Array.isArray(schema.tables)) { return null; }
+
+      for (const t of schema.tables) {
+        if (normalizeIdentifier(t.name).toLowerCase() === target) {
+          return {
+            range: new monaco.Range(position.lineNumber, wordInfo.startColumn, position.lineNumber, wordInfo.endColumn),
+            contents: [
+              { value: '**' + t.name + '**' },
+              { value: 'Type: ' + (t.type || 'TABLE') },
+              { value: 'Columns: ' + (Array.isArray(t.columns) ? t.columns.length : 0) },
+            ],
+          };
+        }
+        for (const c of (t.columns || [])) {
+          if (normalizeIdentifier(c.name).toLowerCase() === target) {
+            const docs = [
+              '**' + t.name + '.' + c.name + '**',
+              'Type: ' + (c.columnType || c.dataType || ''),
+              'Nullable: ' + (c.nullable || ''),
+            ];
+            if (c.comment) { docs.push('Comment: ' + c.comment); }
+            return {
+              range: new monaco.Range(position.lineNumber, wordInfo.startColumn, position.lineNumber, wordInfo.endColumn),
+              contents: docs.map(function(v) { return { value: v }; }),
+            };
+          }
+        }
+      }
+      return null;
     }
-    if (ch === '\t') {
-      out += '<span class="sql-space">\t</span>';
-      continue;
+  });
+}
+
+function getCssVar(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+function applyMonacoTheme() {
+  if (!monacoRef) { return; }
+  const bodyClass = document.body.className || '';
+  const isDark = /vscode-dark|vscode-high-contrast/.test(bodyClass);
+  monacoRef.editor.defineTheme('dbviewer-vscode', {
+    base: isDark ? 'vs-dark' : 'vs',
+    inherit: true,
+    rules: [],
+    colors: {
+      'editor.background': getCssVar('--vscode-editor-background', isDark ? '#1e1e1e' : '#ffffff'),
+      'editor.foreground': getCssVar('--vscode-editor-foreground', isDark ? '#d4d4d4' : '#333333'),
+      'editorLineNumber.foreground': getCssVar('--vscode-editorLineNumber-foreground', isDark ? '#858585' : '#237893'),
+      'editorCursor.foreground': getCssVar('--vscode-editorCursor-foreground', isDark ? '#aeafad' : '#000000'),
+      'editor.selectionBackground': getCssVar('--vscode-editor-selectionBackground', isDark ? '#264f78' : '#add6ff'),
+      'editor.inactiveSelectionBackground': getCssVar('--vscode-editor-inactiveSelectionBackground', isDark ? '#3a3d41' : '#e5ebf1'),
+      'editor.lineHighlightBackground': getCssVar('--vscode-editor-lineHighlightBackground', isDark ? '#2a2d2e' : '#f7f7f7'),
+      'editorWidget.background': getCssVar('--vscode-editorWidget-background', isDark ? '#252526' : '#f3f3f3'),
+      'editorWidget.border': getCssVar('--vscode-editorWidget-border', isDark ? '#454545' : '#c8c8c8'),
+      'editorSuggestWidget.background': getCssVar('--vscode-editorSuggestWidget-background', isDark ? '#252526' : '#f3f3f3'),
+      'editorSuggestWidget.foreground': getCssVar('--vscode-editorSuggestWidget-foreground', isDark ? '#cccccc' : '#616161'),
+      'editorSuggestWidget.border': getCssVar('--vscode-editorSuggestWidget-border', isDark ? '#454545' : '#c8c8c8'),
+    },
+  });
+  monacoRef.editor.setTheme('dbviewer-vscode');
+}
+
+function indexToPos(input, index) {
+  let line = 1;
+  let col = 1;
+  for (let i = 0; i < index && i < input.length; i++) {
+    if (input[i] === '\n') {
+      line += 1;
+      col = 1;
+    } else {
+      col += 1;
     }
-    out += '<span class="' + cls + '">' + esc(ch) + '</span>';
   }
-  return out;
+  return { lineNumber: line, column: col };
 }
 
-function renderSqlHighlight(sql) {
-  const parts = [];
+function analyzeSql(input) {
+  const markers = [];
   let i = 0;
+  let quote = '';
+  let blockComment = false;
+  let lineComment = false;
+  let depth = 0;
+  let nonWsInStmt = false;
+  let stmtCount = 0;
+  const openParens = [];
 
-  while (i < sql.length) {
-    const ch = sql[i];
+  while (i < input.length) {
+    const ch = input[i];
+    const next = input[i + 1];
 
-    if (/\s/.test(ch)) {
-      const start = i;
-      while (i < sql.length && /\s/.test(sql[i])) { i++; }
-      parts.push(renderToken(sql.slice(start, i), 'sql-space'));
-      continue;
-    }
-
-    if (ch === '/' && sql[i + 1] === '*') {
-      const start = i;
-      i += 2;
-      while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) { i++; }
-      if (i < sql.length) { i += 2; }
-      parts.push(renderToken(sql.slice(start, i), 'sql-comment'));
-      continue;
-    }
-
-    if (ch === '-' && sql[i + 1] === '-') {
-      const start = i;
-      i += 2;
-      while (i < sql.length && sql[i] !== '\n') { i++; }
-      parts.push(renderToken(sql.slice(start, i), 'sql-comment'));
-      continue;
-    }
-
-    if (ch === '#') {
-      const start = i;
+    if (lineComment) {
+      if (ch === '\n') { lineComment = false; }
       i += 1;
-      while (i < sql.length && sql[i] !== '\n') { i++; }
-      parts.push(renderToken(sql.slice(start, i), 'sql-comment'));
       continue;
     }
 
+    if (blockComment) {
+      if (ch === '*' && next === '/') {
+        blockComment = false;
+        i += 2;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (quote) {
+      if (ch === '\\') {
+        i += 2;
+        continue;
+      }
+      if (ch === quote) {
+        quote = '';
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === '-' && next === '-') {
+      lineComment = true;
+      i += 2;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      blockComment = true;
+      i += 2;
+      continue;
+    }
     if (ch === '\'' || ch === '"' || ch === '`') {
-      const end = readQuotedToken(sql, i, ch);
-      parts.push(renderToken(sql.slice(i, end), 'sql-string'));
-      i = end;
-      continue;
-    }
-
-    if (/\d/.test(ch)) {
-      const start = i;
-      while (i < sql.length && /[\d._]/.test(sql[i])) { i++; }
-      parts.push(renderToken(sql.slice(start, i), 'sql-number'));
-      continue;
-    }
-
-    if (/[A-Za-z_]/.test(ch)) {
-      const start = i;
-      while (i < sql.length && /[A-Za-z0-9_$]/.test(sql[i])) { i++; }
-      const word = sql.slice(start, i);
-      const cls = SQL_KEYWORDS.has(word.toUpperCase()) ? 'sql-keyword' : 'sql-ident';
-      parts.push(renderToken(word, cls));
-      continue;
-    }
-
-    if (/[=<>!+\-*/%|&^~]/.test(ch)) {
-      parts.push(renderToken(ch, 'sql-operator'));
+      quote = ch;
       i += 1;
       continue;
     }
 
-    parts.push(renderToken(ch, 'sql-punct'));
+    if (!/\s/.test(ch)) { nonWsInStmt = true; }
+
+    if (ch === '(') {
+      depth += 1;
+      openParens.push(i);
+    } else if (ch === ')') {
+      if (depth === 0) {
+        const p = indexToPos(input, i);
+        markers.push({
+          severity: monacoRef.MarkerSeverity.Error,
+          message: '发现多余的右括号 )',
+          startLineNumber: p.lineNumber,
+          startColumn: p.column,
+          endLineNumber: p.lineNumber,
+          endColumn: p.column + 1,
+        });
+      } else {
+        depth -= 1;
+        openParens.pop();
+      }
+    } else if (ch === ';') {
+      if (nonWsInStmt) {
+        stmtCount += 1;
+        nonWsInStmt = false;
+      }
+    }
     i += 1;
   }
 
-  highlightEl.innerHTML = parts.join('') || '<span class="sql-space"> </span>';
-  syncHighlightScroll();
+  if (nonWsInStmt) { stmtCount += 1; }
+
+  if (quote) {
+    const p = indexToPos(input, input.length);
+    markers.push({
+      severity: monacoRef.MarkerSeverity.Error,
+      message: '引号未闭合',
+      startLineNumber: p.lineNumber,
+      startColumn: Math.max(1, p.column - 1),
+      endLineNumber: p.lineNumber,
+      endColumn: p.column,
+    });
+  }
+
+  if (depth > 0 && openParens.length) {
+    const idx = openParens[openParens.length - 1];
+    const p = indexToPos(input, idx);
+    markers.push({
+      severity: monacoRef.MarkerSeverity.Error,
+      message: '左括号未闭合',
+      startLineNumber: p.lineNumber,
+      startColumn: p.column,
+      endLineNumber: p.lineNumber,
+      endColumn: p.column + 1,
+    });
+  }
+
+  if (stmtCount > 1) {
+    markers.push({
+      severity: monacoRef.MarkerSeverity.Warning,
+      message: '当前页面仅支持执行单条 SQL 语句',
+      startLineNumber: 1,
+      startColumn: 1,
+      endLineNumber: 1,
+      endColumn: 2,
+    });
+  }
+
+  return markers;
+}
+
+function scheduleValidation() {
+  if (!monacoEditor || !monacoRef) { return; }
+  if (validateTimer) { clearTimeout(validateTimer); }
+  validateTimer = setTimeout(function() {
+    const model = monacoEditor.getModel();
+    if (!model) { return; }
+    const markers = analyzeSql(monacoEditor.getValue());
+    monacoRef.editor.setModelMarkers(model, markerOwner, markers);
+  }, 180);
 }
 
 function setStatus(type, text) {
@@ -370,12 +672,27 @@ function setStatus(type, text) {
 }
 
 function runQuery() {
-  const sql = sqlEl.value.trim();
+  const sqlRaw = getEditorValue();
+  const sql = sqlRaw.trim();
   if (!sql) {
     setStatus('error', '请输入 SQL 语句');
     return;
   }
-  vscode.postMessage({ command: 'saveDraft', sql: sqlEl.value });
+  if (monacoEditor && monacoRef) {
+    const model = monacoEditor.getModel();
+    if (model) {
+      const markers = analyzeSql(sqlRaw);
+      monacoRef.editor.setModelMarkers(model, markerOwner, markers);
+      const hasError = markers.some(function(m) {
+        return m.severity === monacoRef.MarkerSeverity.Error;
+      });
+      if (hasError) {
+        setStatus('error', 'SQL 存在语法问题，请先修复后再执行');
+        return;
+      }
+    }
+  }
+  vscode.postMessage({ command: 'saveDraft', sql: sqlRaw });
   setStatus('ok', '执行中...');
   vscode.postMessage({ command: 'execute', sql });
 }
@@ -433,91 +750,25 @@ function exportResult(format) {
   });
 }
 
-function toggleLineComments() {
-  const full = sqlEl.value;
-  const selStart = sqlEl.selectionStart;
-  const selEnd = sqlEl.selectionEnd;
-
-  const lineStart = full.lastIndexOf('\n', Math.max(0, selStart - 1)) + 1;
-  let lineEnd = full.indexOf('\n', selEnd);
-  if (lineEnd === -1) { lineEnd = full.length; }
-
-  const block = full.slice(lineStart, lineEnd);
-  const lines = block.split('\n');
-  const hasNonEmpty = lines.some(function(line) { return line.trim().length > 0; });
-  const allCommented = hasNonEmpty && lines.every(function(line) {
-    if (!line.trim()) { return true; }
-    return /^\s*--\s?/.test(line);
-  });
-
-  const nextLines = lines.map(function(line) {
-    if (!line.trim()) { return line; }
-    if (allCommented) {
-      return line.replace(/^(\s*)--\s?/, '$1');
-    }
-    return line.replace(/^(\s*)/, '$1-- ');
-  });
-
-  const nextBlock = nextLines.join('\n');
-  const nextValue = full.slice(0, lineStart) + nextBlock + full.slice(lineEnd);
-  sqlEl.value = nextValue;
-
-  const delta = nextBlock.length - block.length;
-  if (selStart === selEnd) {
-    sqlEl.selectionStart = selStart;
-    sqlEl.selectionEnd = selEnd;
-  } else {
-    sqlEl.selectionStart = lineStart;
-    sqlEl.selectionEnd = selEnd + delta;
-  }
-
-  renderSqlHighlight(sqlEl.value);
-  queueSaveDraft();
-}
-
-function toggleBlockComment() {
-  const full = sqlEl.value;
-  let selStart = sqlEl.selectionStart;
-  let selEnd = sqlEl.selectionEnd;
-
-  if (selStart === selEnd) {
-    const lineStart = full.lastIndexOf('\n', Math.max(0, selStart - 1)) + 1;
-    let lineEnd = full.indexOf('\n', selEnd);
-    if (lineEnd === -1) { lineEnd = full.length; }
-    selStart = lineStart;
-    selEnd = lineEnd;
-  }
-
-  const selected = full.slice(selStart, selEnd);
-  const trimmed = selected.trim();
-  const isWrapped = trimmed.startsWith('/*') && trimmed.endsWith('*/') && trimmed.length >= 4;
-
-  let nextSelected = '';
-  if (isWrapped) {
-    const leftTrimCount = selected.length - selected.trimStart().length;
-    const rightTrimCount = selected.length - selected.trimEnd().length;
-    const coreStart = leftTrimCount + 2;
-    const coreEnd = selected.length - rightTrimCount - 2;
-    nextSelected = selected.slice(0, leftTrimCount) + selected.slice(coreStart, coreEnd) + selected.slice(selected.length - rightTrimCount);
-  } else if (selected.includes('\n')) {
-    nextSelected = '/*\n' + selected + '\n*/';
-  } else {
-    nextSelected = '/* ' + selected + ' */';
-  }
-
-  sqlEl.value = full.slice(0, selStart) + nextSelected + full.slice(selEnd);
-  sqlEl.selectionStart = selStart;
-  sqlEl.selectionEnd = selStart + nextSelected.length;
-
-  renderSqlHighlight(sqlEl.value);
-  queueSaveDraft();
-}
-
 window.addEventListener('message', function(e) {
   const msg = e.data;
+  if (msg.type === 'intellisenseSchema') {
+    const requestId = String(msg.requestId || '');
+    const pending = pendingSchema.get(requestId);
+    if (!pending) { return; }
+    clearTimeout(pending.timer);
+    pendingSchema.delete(requestId);
+    if (msg.error) {
+      pending.resolve(null);
+      return;
+    }
+    schemaCache = msg.schema || null;
+    pending.resolve(schemaCache);
+    return;
+  }
   if (msg.type === 'init') {
-    sqlEl.value = String(msg.sql || '');
-    renderSqlHighlight(sqlEl.value);
+    setEditorValue(String(msg.sql || ''));
+    requestSchema(true).catch(function() {});
     return;
   }
   if (msg.type === 'error') {
@@ -641,27 +892,61 @@ function jsonHL(val, depth) {
 }
 
 document.addEventListener('keydown', function(ev) {
-  if ((ev.key === 'A' || ev.key === 'a') && ev.shiftKey && ev.altKey) {
-    ev.preventDefault();
-    toggleBlockComment();
-    return;
-  }
-  if (ev.key === '/' && (ev.metaKey || ev.ctrlKey)) {
-    ev.preventDefault();
-    toggleLineComments();
-    return;
-  }
-  if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) runQuery();
   if (ev.key === 'Escape') closeModal();
 });
 
-sqlEl.addEventListener('input', function() {
-  renderSqlHighlight(sqlEl.value);
-  queueSaveDraft();
-});
-sqlEl.addEventListener('scroll', syncHighlightScroll);
+function setupMonaco() {
+  const monacoBase = '{{MONACO_BASE_URI}}';
+  if (!window.require || !monacoBase) {
+    fallbackEl.style.display = 'block';
+    fallbackEl.addEventListener('input', queueSaveDraft);
+    return;
+  }
 
-renderSqlHighlight(sqlEl.value);
+  window.MonacoEnvironment = {
+    getWorkerUrl: function() {
+      const workerSrc = "self.MonacoEnvironment={baseUrl:'" + monacoBase + "'};importScripts('" + monacoBase + "/base/worker/workerMain.js');";
+      return 'data:text/javascript;charset=utf-8,' + encodeURIComponent(workerSrc);
+    }
+  };
+
+  window.require.config({ paths: { vs: monacoBase } });
+  window.require(['vs/editor/editor.main'], function() {
+    monacoRef = window.monaco;
+    registerIntellisense(monacoRef);
+    monacoEditor = monacoRef.editor.create(editorEl, {
+      value: fallbackEl.value || '',
+      language: 'sql',
+      automaticLayout: true,
+      minimap: { enabled: false },
+      fontSize: 13,
+      lineNumbers: 'on',
+      wordWrap: 'on',
+      suggestOnTriggerCharacters: true,
+      quickSuggestions: { other: true, comments: false, strings: false },
+      tabSize: 2,
+      insertSpaces: true,
+    });
+    applyMonacoTheme();
+    const themeObserver = new MutationObserver(function() {
+      applyMonacoTheme();
+    });
+    themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class', 'style'] });
+
+    monacoEditor.onDidChangeModelContent(function() {
+      queueSaveDraft();
+      scheduleValidation();
+    });
+    monacoEditor.addCommand(monacoRef.KeyMod.CtrlCmd | monacoRef.KeyCode.Enter, runQuery);
+    scheduleValidation();
+    requestSchema(true).catch(function() {});
+  }, function() {
+    fallbackEl.style.display = 'block';
+    fallbackEl.addEventListener('input', queueSaveDraft);
+  });
+}
+
+setupMonaco();
 vscode.postMessage({ command: 'ready' });
 </script>
 </body>
