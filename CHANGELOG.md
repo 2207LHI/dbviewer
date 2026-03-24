@@ -8,6 +8,12 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - 初始开发与修复（见下面版本历史）
 
+## [0.0.6] - 2026-03-24
+
+- 修复 SQL 编辑区剪贴板交互：恢复 `Cmd/Ctrl + C/X/V/A` 快捷键在查询编辑器中的可用性。
+- 修复 SQL 编辑区右键剪贴板操作：新增查询编辑器右键菜单，支持剪切/复制/粘贴/全选。
+- 查询编辑器交互细节优化：增强 webview 场景下 Monaco 编辑区的输入稳定性与易用性。
+
 ## [0.0.5] - 2026-03-24
 
 - SQL 查询编辑器升级为 Monaco：支持更完善的编辑体验、建议面板和悬浮信息展示。
