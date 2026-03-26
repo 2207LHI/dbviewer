@@ -41,6 +41,9 @@ body {
   border-radius: 4px;
   background: var(--vscode-editor-background);
   height: 280px;
+  min-height: 180px;
+  resize: vertical;
+  overflow: hidden;
 }
 #sql-wrap:focus-within {
   border-color: var(--vscode-focusBorder, var(--vscode-editorWidget-border, #666));
@@ -240,6 +243,7 @@ const schemaReqTimeoutMs = 6000;
 let validateTimer = null;
 const markerOwner = 'dbviewer-sql';
 let menuVisible = false;
+let editorResizeObserver = null;
 
 const SQL_KEYWORDS = [
   'SELECT','FROM','WHERE','GROUP','BY','ORDER','LIMIT','OFFSET','INSERT','INTO','VALUES','UPDATE','SET','DELETE',
@@ -1067,6 +1071,16 @@ function setupMonaco() {
       queueSaveDraft();
       scheduleValidation();
     });
+
+    if (typeof ResizeObserver !== 'undefined') {
+      editorResizeObserver = new ResizeObserver(function() {
+        if (monacoEditor) {
+          monacoEditor.layout();
+        }
+      });
+      editorResizeObserver.observe(document.getElementById('sql-wrap'));
+    }
+
     monacoEditor.addCommand(monacoRef.KeyMod.CtrlCmd | monacoRef.KeyCode.Enter, runQuery);
     editorEl.addEventListener('contextmenu', function(ev) {
       ev.preventDefault();
