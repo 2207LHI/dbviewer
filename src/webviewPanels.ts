@@ -354,8 +354,7 @@ export class ConnectionConfigPanel {
           await saveConfigs(context, configs);
           await deletePwd(context, msg.id);
           await provider.disconnect(msg.id);
-          provider.refresh();
-          // 再次延迟刷新以避免删除首项时的显示问题
+          // 延迟刷新以避免删除首项时的显示问题
           try { setTimeout(() => { provider.refresh(); }, 120); } catch {}
           panel.webview.postMessage({ type: 'ok', message: `连接已删除：id=${msg.id}` });
           // 关闭编辑面板

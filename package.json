@@ -2,7 +2,11 @@
   "name": "dbviewer",
   "displayName": "MySQL Simple Viewer",
   "description": "MySQL database viewer for VS Code",
-  "version": "0.0.6",
+  "version": "0.0.9",
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
   "publisher": "cxwang",
   "engines": {
     "vscode": "^1.80.0"
@@ -11,7 +15,16 @@
     "Other"
   ],
   "activationEvents": [
-    "onView:dbviewer.databasesView"
+    "onStartupFinished",
+    "onView:dbviewer.databasesView",
+    "onCommand:dbviewer.openTable",
+    "onCommand:dbviewer.exportConnections",
+    "onCommand:dbviewer.importConnections",
+    "onCommand:dbviewer.addConnection",
+    "onCommand:dbviewer.editConnection",
+    "onCommand:dbviewer.deleteConnection",
+    "onCommand:dbviewer.refreshConnection",
+    "onCommand:dbviewer.openQuery"
   ],
   "main": "./out/extension.js",
   "contributes": {

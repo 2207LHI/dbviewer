@@ -36,6 +36,8 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
     private connToSshKey = new Map<string, string>();
     private intentionallyClosing = new Set<string>();
     private sshKeyLocks = new Map<string, Promise<void>>();
+    private readonly dbListCacheTtlMs = 60000;
+    private dbListCache = new Map<string, { ts: number; rows: mysql.RowDataPacket[] }>();
     private _onDidChangeTreeData = new vscode.EventEmitter<DatabaseTreeItem | undefined | void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
     
@@ -56,8 +58,17 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
             const conn = this.dbManager.getConnection(cfg.id);
             if (conn) { this.connections.set(cfg.id, conn); }
         }
+        this.dbListCache.delete(cfg.id);
         // 连接状态变化后做全量刷新，确保节点展开/子节点加载与最新连接状态一致
         this.refresh();
+    }
+
+    clearDatabaseCache(id?: string): void {
+        if (id) {
+            this.dbListCache.delete(id);
+            return;
+        }
+        this.dbListCache.clear();
     }
 
     private sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -119,6 +130,7 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
                 }
                 this.connToSshKey.delete(id);
             }
+            this.dbListCache.delete(id);
             // 仅刷新该连接节点，避免影响其它连接的 UI 状态
             this.refresh();
         } catch (err) {
@@ -139,6 +151,7 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
             await this.sshManager.disconnect(id);
         }
         this.connections.clear();
+        this.dbListCache.clear();
     }
 
     isConnected(id: string): boolean { return this.connections.has(id); }
@@ -161,7 +174,7 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
                     const item = new DatabaseTreeItem(
                         { type: 'connection', label: cfg.name, connId: cfg.id },
                         cfg.name,
-                        connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
+                        vscode.TreeItemCollapsibleState.Collapsed
                     );
                     if (connected) {
                         item.iconPath = {
@@ -189,7 +202,19 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
                 const conn = this.connections.get(element.node.connId);
                 if (!conn) { return []; }
                 try {
-                    const [rows] = await conn.query<mysql.RowDataPacket[]>('SHOW DATABASES');
+                    const cached = this.dbListCache.get(element.node.connId);
+                    let rows: mysql.RowDataPacket[];
+                    if (cached && (Date.now() - cached.ts) < this.dbListCacheTtlMs) {
+                        rows = cached.rows;
+                    } else {
+                        const [freshRows] = await conn.query<mysql.RowDataPacket[]>('SHOW DATABASES');
+                        if (!Array.isArray(freshRows)) {
+                            try { outputChannel?.appendLine(`[WARN] SHOW DATABASES returned non-array for connId=${element.node.connId}: ${JSON.stringify(freshRows).slice(0,200)}`); } catch {}
+                            return [];
+                        }
+                        rows = freshRows;
+                        this.dbListCache.set(element.node.connId, { ts: Date.now(), rows });
+                    }
                     if (!Array.isArray(rows)) {
                         try { outputChannel?.appendLine(`[WARN] SHOW DATABASES returned non-array for connId=${element.node.connId}: ${JSON.stringify(rows).slice(0,200)}`); } catch {}
                         return [];
@@ -274,7 +299,7 @@ class DatabaseTreeDataProvider implements vscode.TreeDataProvider<DatabaseTreeIt
         const item = new DatabaseTreeItem(
             { type: 'connection', label: cfg.name, connId: cfg.id },
             cfg.name,
-            connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
+            vscode.TreeItemCollapsibleState.Collapsed
         );
         if (connected) {
             item.iconPath = {
@@ -376,6 +401,7 @@ export function activate(context: vscode.ExtensionContext) {
 		if (!cfg) { vscode.window.showWarningMessage('未找到连接配置'); return; }
 		const pwd = await loadPwd(context, id);
 		try {
+            provider.clearDatabaseCache(id);
 			try { outputChannel?.appendLine(`[DBG] refreshConnCmd: disconnecting ${id}`); } catch {}
 			await provider.disconnect(id);
 			try { outputChannel?.appendLine(`[DBG] refreshConnCmd: disconnected ${id}, connections=${Array.from(provider['connections'].keys()).join(',')}`); } catch {}
@@ -404,9 +430,9 @@ export function activate(context: vscode.ExtensionContext) {
 		await saveConfigs(context, configs);
 		await deletePwd(context, id);
 		await provider.disconnect(id);
-        provider.refresh();
+        provider.clearDatabaseCache(id);
         // 防止删除第一个连接时出现 UI 竞态，稍后再触发一次完整刷新
-        setTimeout(() => { try { provider.refresh(); outputChannel?.appendLine('[DBG] delayed refresh after deleteConnCmd'); } catch {} }, 120);
+		setTimeout(() => { try { provider.refresh(); outputChannel?.appendLine('[DBG] delayed refresh after deleteConnCmd'); } catch {} }, 120);
 	});
 
 	// ── 刷新 ──────────────────────────────────────────────────
@@ -465,6 +491,7 @@ export function activate(context: vscode.ExtensionContext) {
 				const pwd = await loadPwd(context, cfg.id);
 				if (pwd) { await tryConnect(provider, cfg, pwd, true); }
 			}
+            provider.clearDatabaseCache();
 			provider.refresh();
 			vscode.window.showInformationMessage(`已从 ${selected} 导入 ${configsToSave.length} 个连接（若文件含密码已保存到 Secret）`);
 		} catch (err) {

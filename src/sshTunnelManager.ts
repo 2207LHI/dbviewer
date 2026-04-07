@@ -2,16 +2,26 @@ import * as mysql from 'mysql2/promise';
 import * as fs from 'fs';
 import { ConnectionConfig } from './types';
 
-const SSHClient: any = require('ssh2').Client;
-
 export class SshTunnelManager {
   private sshClients = new Map<string, any>();
   private connections = new Map<string, mysql.Connection>();
+
+  private getSshClientCtor(): any {
+    try {
+      return require('ssh2').Client;
+    } catch (err) {
+      const msg = (typeof err === 'object' && err && 'message' in err)
+        ? (err as any).message
+        : String(err);
+      throw new Error(`SSH runtime unavailable: ${msg}`);
+    }
+  }
 
   async connectViaSsh(cfg: ConnectionConfig, password: string): Promise<void> {
     const sshKey = `${cfg.sshHost}|${cfg.sshPort ?? 22}|${cfg.sshUser}|${cfg.sshPrivateKey ?? ''}`;
     let holder = this.sshClients.get(sshKey);
     if (!holder) {
+      const SSHClient = this.getSshClientCtor();
       const ssh = new SSHClient();
       holder = {
         client: ssh,

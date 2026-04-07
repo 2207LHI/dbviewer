@@ -8,6 +8,21 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - 初始开发与修复（见下面版本历史）
 
+## [0.0.9] - 2026-04-07
+
+- 增加 `extensionKind: ["workspace", "ui"]`，支持同一版本同时用于本地与远程场景，并在远程工作区中优先运行在 workspace host。
+- 进一步降低远程会话下命令注册到错误扩展主机导致 `command "dbviewer.xxx" not found` 的概率。
+
+## [0.0.8] - 2026-04-07
+
+- 进一步修复远程环境下可能出现的 `command "dbviewer.xxx" not found`：新增 `onStartupFinished` 激活事件，确保扩展在窗口启动后完成激活。
+- 将 `ssh2` 改为按需加载，避免因 SSH 运行时加载失败导致扩展整体激活失败（从而所有命令不可用）。
+
+## [0.0.7] - 2026-04-07
+
+- 修复远程服务器环境下部分命令触发时报错 `command dbviewer.xxx not found` 的问题。
+- 在扩展激活配置中为已贡献命令补充 `onCommand` 事件，确保命令触发时可自动激活扩展。
+
 ## [0.0.6] - 2026-03-24
 
 - 修复 SQL 编辑区剪贴板交互：恢复 `Cmd/Ctrl + C/X/V/A` 快捷键在查询编辑器中的可用性。
